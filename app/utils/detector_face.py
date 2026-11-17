@@ -2,6 +2,7 @@ import cv2
 import os
 import time
 import numpy as np
+import threading
 from pathlib import Path
 from deepface import DeepFace
 from app.database.connection import get_db
@@ -183,6 +184,38 @@ def draw_hud_face_box(img, x, y, w, h, label_text="", color=(0, 140, 255), thick
                 except Exception:
                     print("\a\a")
         
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+FACE_IMAGES_DIR = BASE_DIR / "data" / "face_images"
+os.makedirs(FACE_IMAGES_DIR, exist_ok=True)
+
+
+def resolve_image_path(raw_path: str) -> str:
+    """
+    Chuẩn hóa và phân giải đường dẫn ảnh khuôn mặt mẫu:
+    - Nếu đường dẫn hiện tại (tuyệt đối hoặc tương đối theo BASE_DIR) tồn tại trên ổ cứng -> trả về đường dẫn đó.
+    - Nếu đường dẫn cũ trong DB có dạng 'D:/Image/xyz.jpg' hoặc 'D:\\Image\\xyz.jpg' không tồn tại ở ổ D,
+      tách lấy tên file 'xyz.jpg' và tìm trong TechStore/data/face_images/xyz.jpg.
+    """
+    if not raw_path:
+        return ""
+
+    raw_str = str(raw_path).strip()
+    if os.path.exists(raw_str):
+        return str(Path(raw_str).resolve())
+
+    rel_candidate = BASE_DIR / raw_str
+    if rel_candidate.exists():
+        return str(rel_candidate.resolve())
+
+    # Tách lấy tên file (hỗ trợ cả '/' và '\' từ đường dẫn cũ như D:/Image/xyz.jpg hoặc D:\Image\xyz.jpg)
+    filename = os.path.basename(raw_str.replace("\\", "/"))
+    fallback_candidate = FACE_IMAGES_DIR / filename
+    if fallback_candidate.exists():
+        return str(fallback_candidate.resolve())
+
+    return str(fallback_candidate)
+
+
 def verify_face_from_camera(username_input):
     if not username_input:
         return False, "Vui lòng nhập tên đăng nhập trước khi xác thực khuôn mặt!", None
@@ -198,8 +231,22 @@ def verify_face_from_camera(username_input):
     if not stored_paths and user.get("image_path"):
         stored_paths = [user.get("image_path")]
 
-    # Lọc lại các đường dẫn file ảnh mẫu thực sự tồn tại trên ổ cứng
-    valid_stored_paths = [p for p in stored_paths if os.path.exists(p)]
+    print(f"\n[DEBUG Face] Danh sách đường dẫn ảnh mẫu từ DB ({username_input}): {stored_paths}")
+
+    # 1. Đảm bảo chạy hoàn toàn Offline: cấu hình DEEPFACE_HOME trỏ tới thư mục weights cục bộ nếu có
+    for candidate in [BASE_DIR, BASE_DIR / ".deepface", Path.home() / ".deepface"]:
+        if (candidate / "weights" / "arcface_weights.h5").exists():
+            os.environ["DEEPFACE_HOME"] = str(candidate.parent if candidate.name == ".deepface" else candidate)
+            break
+
+    # Lọc lại các đường dẫn file ảnh mẫu thực sự tồn tại trên ổ cứng qua resolve_image_path
+    valid_stored_paths = []
+    for p in stored_paths:
+        resolved_p = resolve_image_path(p)
+        exists = os.path.exists(resolved_p)
+        print(f"[DEBUG Face] Resolve: '{p}' -> '{resolved_p}' | Tồn tại trên ổ cứng: {exists}")
+        if exists:
+            valid_stored_paths.append(resolved_p)
     
     if not valid_stored_paths:
         return False, f"Tài khoản '{username_input}' chưa đăng ký ảnh khuôn mặt mẫu nào trong hệ thống!", None
@@ -211,7 +258,6 @@ def verify_face_from_camera(username_input):
     
     messagebox.showinfo("Thông báo", f"Hệ thống nhận diện khuôn mặt. Hãy nhìn thẳng, xoay nhẹ trái/phải, tìm được khung hình khớp sẽ tự động đăng nhập!")
 
-    BASE_DIR = Path(__file__).resolve().parent.parent.parent
     cascade_path = str(BASE_DIR / "haarcascade_frontalface_default.xml")
     face_cascade = cv2.CascadeClassifier(cascade_path) if os.path.exists(cascade_path) else None
 
@@ -220,16 +266,79 @@ def verify_face_from_camera(username_input):
         return False, "Không tìm thấy file Haar Cascade để nhận diện mặt!", None
 
     start_time = time.time()
-    TIMEOUT = 15.0           # Quét tối đa 10 giây
-    CHECK_INTERVAL = 0.7     # Kiểm tra AI mỗi 0.7 giây
-    last_check_time = time.time()
+    TIMEOUT = 15.0           # Quét tối đa 15 giây
+    CHECK_INTERVAL = 0.4     # Khoảng thời gian tối thiểu giữa 2 lần đẩy frame vào luồng AI
+    last_check_time = 0.0
 
     success_start_time = None
     success_result = None
     hud_state = {"audio_played": False}
+    CUSTOM_THRESHOLD = 0.25  # Ngưỡng của mô hình ArcFace
 
-    temp_dir = Path("D:/Image")
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    # Bộ nhớ đệm lưu đặc trưng (embedding) của các ảnh mẫu đã trích xuất bằng detector_backend="opencv"
+    sample_embeddings_cache = {}
+
+    # Biến trạng thái và Lock đồng bộ đa luồng (Threading)
+    thread_lock = threading.Lock()
+    is_verifying = False
+    verified_success = False
+
+    def async_verification_worker(face_rgb_img, sample_paths, user_data):
+        nonlocal is_verifying, verified_success, success_result
+        try:
+            for sample_path in sample_paths:
+                with thread_lock:
+                    if verified_success:
+                        break
+                try:
+                    # Đối với img1_path (ảnh mẫu từ ổ cứng): dùng detector_backend="opencv" để trích xuất khuôn mặt
+                    # và đồng bộ hệ màu RGB với face_rgb_img
+                    if sample_path not in sample_embeddings_cache:
+                        sample_bgr = cv2.imread(sample_path)
+                        if sample_bgr is not None:
+                            sample_rgb = cv2.cvtColor(sample_bgr, cv2.COLOR_BGR2RGB)
+                            repr_objs = DeepFace.represent(
+                                img_path=sample_rgb,
+                                model_name="ArcFace",
+                                detector_backend="opencv",
+                                enforce_detection=False
+                            )
+                        else:
+                            repr_objs = DeepFace.represent(
+                                img_path=sample_path,
+                                model_name="ArcFace",
+                                detector_backend="opencv",
+                                enforce_detection=False
+                            )
+                        sample_embeddings_cache[sample_path] = repr_objs[0]["embedding"]
+
+                    img1_source = sample_embeddings_cache[sample_path]
+
+                    # Đối với img2_path (face_rgb_img đã được crop sẵn khuôn mặt và đổi sang RGB):
+                    # đặt detector_backend="skip" và enforce_detection=False
+                    result = DeepFace.verify(
+                        img1_path=img1_source,
+                        img2_path=face_rgb_img,
+                        model_name="ArcFace",
+                        distance_metric="cosine",
+                        detector_backend="skip",
+                        enforce_detection=False
+                    )
+                    dist = result.get("distance", 1.0)
+                    print(f"[DEBUG Face] File: {sample_path} | Distance: {dist:.4f} | Ngưỡng: {CUSTOM_THRESHOLD}")
+
+                    if dist <= CUSTOM_THRESHOLD:
+                        with thread_lock:
+                            verified_success = True
+                            success_result = (True, "Xác thực thành công!", user_data)
+                        # Tìm thấy 1 ảnh mẫu đạt ngưỡng -> lập tức break, không quét tiếp
+                        break
+                except Exception as e:
+                    print(f"[DEBUG Face Error]: {e}")
+                    continue
+        finally:
+            with thread_lock:
+                is_verifying = False
 
     while True:
         ret, frame = cap.read()
@@ -243,13 +352,18 @@ def verify_face_from_camera(username_input):
         elapsed = current_time - start_time
         remaining_time = max(0, int(TIMEOUT - elapsed))
 
-        # Phát hiện mặt để vẽ khung xanh hướng dẫn
+        # Phát hiện mặt để vẽ khung xanh hướng dẫn (chạy nhanh trên main thread)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
 
+        # Kiểm tra kết quả từ luồng ngầm
+        with thread_lock:
+            if verified_success and success_start_time is None:
+                success_start_time = current_time
+
         if success_start_time is not None:
             elapsed_success = current_time - success_start_time
-            if current_time - success_start_time >= 5.0:
+            if elapsed_success >= 3.0:
                 break
             if 'anim_start_time' not in locals() or anim_start_time is None:
                 anim_start_time = current_time
@@ -263,72 +377,53 @@ def verify_face_from_camera(username_input):
                 for (x, y, w, h) in faces:
                     draw_hud_face_box(display_frame, x, y, w, h, label_text="", color=(0, 140, 255), thickness=3)
 
-        window_name="Face Login"
+        window_name = "Face Login"
         cv2.imshow(window_name, display_frame)
 
         if cv2.waitKey(1) & 0xFF == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:  # Hủy đăng nhập
             break
 
-        if elapsed >= TIMEOUT:
+        if elapsed >= TIMEOUT and success_start_time is None:
             break
 
-        # Cứ mỗi khoảng thời gian và thấy mặt -> Thực hiện đối chiếu
-        if success_start_time is None and current_time - last_check_time >= CHECK_INTERVAL and len(faces) > 0:
+        # Nếu chưa xác thực và luồng so khớp đang rảnh -> Cắt khuôn mặt, resize (112, 112), đổi sang RGB và gửi vào background thread
+        with thread_lock:
+            can_dispatch = (not is_verifying) and (not verified_success)
+
+        if can_dispatch and (current_time - last_check_time >= CHECK_INTERVAL) and len(faces) > 0:
             last_check_time = current_time
             
             try:
-                ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-                channels = list(cv2.split(ycrcb))
-                channels[0] = cv2.equalizeHist(channels[0])
-                balanced_frame = cv2.merge(channels)
-                balanced_frame = cv2.cvtColor(balanced_frame, cv2.COLOR_YCrCb2BGR)
-
-                temp_captured_path = str(temp_dir / f"temp_multi_{username_input}.jpg")
-                
-                # Cắt mặt
+                # Cắt mặt lớn nhất từ frame gốc (tương đồng với cách detector_backend="opencv" cắt trên ảnh mẫu)
                 (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
-                padding = int(w * 0.1)
-                img_h, img_w, _ = balanced_frame.shape
-                x1 = max(0, x - padding)
-                y1 = max(0, y - padding)
-                x2 = min(img_w, x + w + padding)
-                y2 = min(img_h, y + h + padding)
-                cropped = balanced_frame[y1:y2, x1:x2]
+                cropped = frame[y:y+h, x:x+w]
 
                 if cropped.shape[0] > 50 and cropped.shape[1] > 50:
-                    cv2.imwrite(temp_captured_path, cropped)
+                    face_crop = cropped
                 else:
-                    cv2.imwrite(temp_captured_path, balanced_frame)
+                    face_crop = frame
 
-                # ĐỐI CHIẾU LẦN LƯỢT VỚI TẤT CẢ CÁC ẢNH MẪU TRONG DANH SÁCH
-                best_distance_for_frame = float('inf')
-                for sample_path in valid_stored_paths:
-                    try:
-                        result = DeepFace.verify(
-                            img1_path=sample_path,
-                            img2_path=temp_captured_path,
-                            model_name="ArcFace",
-                            detector_backend="opencv"
-                        )
-                        dist = result["distance"]
-                        if dist < best_distance_for_frame:
-                            best_distance_for_frame = dist
-                    except:
-                        continue
+                # Resize nhẹ frame về kích thước chuẩn của ArcFace (112, 112) để tối ưu tải tính toán
+                face_crop = cv2.resize(face_crop, (112, 112), interpolation=cv2.INTER_AREA)
 
-                if os.path.exists(temp_captured_path):
-                    os.remove(temp_captured_path)
+                # Đổi hệ màu từ BGR sang RGB trước khi truyền vào DeepFace
+                face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
 
-                CUSTOM_THRESHOLD = 0.25  # Ngưỡng của mô hình ArcFace
+                with thread_lock:
+                    is_verifying = True
 
-                # ĐẠT NGƯỠNG -> ĐĂNG NHẬP 
-                if best_distance_for_frame <= CUSTOM_THRESHOLD:
-                    similarity_score = max(0, (1 - (best_distance_for_frame / 1.0))) * 100
-                    success_result = (True, f"Xác thực thành công!", user)
-                    success_start_time = time.time()
+                # Đẩy toàn bộ tác vụ so khớp DeepFace vào background thread riêng biệt
+                worker_thread = threading.Thread(
+                    target=async_verification_worker,
+                    args=(face_rgb.copy(), valid_stored_paths, user),
+                    daemon=True
+                )
+                worker_thread.start()
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[DEBUG Face Error]: {e}")
+                with thread_lock:
+                    is_verifying = False
 
     cap.release()
     cv2.destroyAllWindows()

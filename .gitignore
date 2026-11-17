@@ -1,9 +1,8 @@
-.env
-venv/
+﻿venv/
 __pycache__/
-*.pyc
-.docx_tools/
-exports/*.pdf
-dist/
-assets/images/*
-!assets/images/.gitkeep
+*.py[cod]
+.env
+*.h5
+*.part
+.deepface/
+.vscode/

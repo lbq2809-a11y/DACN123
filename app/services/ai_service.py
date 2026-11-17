@@ -17,6 +17,8 @@ import os
 import re
 from datetime import date, datetime, timedelta
 
+from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, DeadlineExceeded
+
 from app.utils.rag_store import query_rag_context
 from app.models import customer as customer_model
 from app.models import order as order_model
@@ -25,11 +27,13 @@ from app.services import report_service
 from app.utils.formatters import money
 from app.utils.text import search_key
 
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 APP_GUIDE = """Bạn là trợ lý của TechStore — phần mềm quản lý bán hàng công nghệ.
-Trả lời NGẮN GỌN bằng tiếng Việt, thân thiện, đúng số liệu được cung cấp.
-Nếu câu hỏi nằm ngoài dữ liệu và cách dùng phần mềm, nói rõ là không có thông tin.
+Trả lời NGẮN GỌN bằng tiếng Việt, nhiệt tình, thân thiện, đúng số liệu được cung cấp.
+- Khi khách hỏi theo đối tượng sử dụng (ví dụ: sinh viên, dân văn phòng, game thủ...) mà trong dữ liệu không có tag phân loại chính xác, KHÔNG mở đầu bằng "Xin lỗi, tôi không có thông tin...". Hãy trả lời trực tiếp và nhiệt tình các sản phẩm phù hợp đang có trong kho.
+- Khi gợi ý sản phẩm cụ thể, luôn kèm theo giá bán và số lượng tồn kho lấy từ dữ liệu snapshot.
+- Chỉ khi câu hỏi hoàn toàn nằm ngoài dữ liệu cửa hàng và cách dùng phần mềm mới nói rõ là không có thông tin.
 
 Cách dùng các màn hình:
 - Bán hàng: tìm sản phẩm (gõ là lọc ngay), double-click hoặc "Thêm vào giỏ";
@@ -232,6 +236,92 @@ USAGE = {
 }
 
 
+def _extract_product_keyword(question: str) -> tuple[str, str, bool]:
+    """Tách từ khóa tìm kiếm (cả có dấu và không dấu) và kiểm tra cờ câu hỏi còn hàng."""
+    raw = question.strip().rstrip("?!.,")
+    q_norm = search_key(raw)
+
+    is_asking = False
+    ask_patterns = [
+        r"^(?:con|co|tim|kiem|xem|muon mua|hoi ve|co ban|ban co|shop co|cua hang co)\s+",
+        r"\s+(?:khong|ko|k|ha|nhi|vay|the|a|nua khong|con khong)$",
+    ]
+    for pat in ask_patterns:
+        if re.search(pat, q_norm):
+            is_asking = True
+            break
+
+    # Làm sạch bản không dấu
+    cleaned_norm = re.sub(
+        r"^(?:cho\s+minh\s+hoi\s+|hoi\s+|shop\s+|ad\s+|ban\s+)?(?:con\s+hang\s+|con\s+|co\s+ban\s+|co\s+|tim\s+kiem\s+|tim\s+|kiem\s+tra\s+|kiem\s+|xem\s+|san\s+pham\s+|gia\s+)?",
+        "", q_norm)
+    cleaned_norm = re.sub(
+        r"(?:\s+khong\s+a|\s+khong|\s+k|\s+ko|\s+ha|\s+nhi|\s+nua\s+khong|\s+con\s+khong|\s+vay|\s+the|\s+a)+$",
+        "", cleaned_norm).strip()
+    cleaned_norm = re.sub(r"\s+(?:loai|mau)?\s*(?:nao|gi)$", "", cleaned_norm).strip()
+
+    # Làm sạch bản gốc có dấu
+    cleaned_orig = re.sub(
+        r"^(?:cho\s+mình\s+hỏi\s+|hỏi\s+|shop\s+|ad\s+|bạn\s+)?(?:còn\s+hàng\s+|còn\s+|có\s+bán\s+|có\s+|tìm\s+kiếm\s+|tìm\s+|kiểm\s+tra\s+|kiểm\s+|xem\s+|sản\s+phẩm\s+|giá\s+)?",
+        "", raw, flags=re.IGNORECASE)
+    cleaned_orig = re.sub(
+        r"(?:\s+không\s+ạ|\s+không|\s+k|\s+ko|\s+hả|\s+nhỉ|\s+nữa\s+không|\s+còn\s+không|\s+vậy|\s+thế|\s+ạ)+$",
+        "", cleaned_orig, flags=re.IGNORECASE).strip()
+    cleaned_orig = re.sub(r"\s+(?:loại|màu)?\s*(?:nào|gì)$", "", cleaned_orig, flags=re.IGNORECASE).strip()
+
+    return cleaned_orig, cleaned_norm, is_asking
+
+
+def _answer_product_search(question: str) -> str | None:
+    """Truy vấn collection products trong MongoDB để tìm sản phẩm theo tên, danh mục hoặc SKU."""
+    kw_orig, kw_norm, is_asking = _extract_product_keyword(question)
+    search_term = kw_norm or search_key(question)
+    if not search_term or len(search_term) < 2:
+        return None
+
+    try:
+        from app.database.connection import get_db
+        db = get_db()
+        safe_orig = re.escape(kw_orig) if kw_orig else ""
+        safe_norm = re.escape(kw_norm) if kw_norm else re.escape(search_term)
+
+        query = {
+            "is_active": True,
+            "$or": [
+                {"name": {"$regex": safe_norm, "$options": "i"}},
+                {"name_search": {"$regex": safe_norm, "$options": "i"}},
+                {"category": {"$regex": safe_norm, "$options": "i"}},
+                {"sku": {"$regex": safe_norm, "$options": "i"}},
+            ]
+        }
+        if safe_orig:
+            query["$or"].extend([
+                {"name": {"$regex": safe_orig, "$options": "i"}},
+                {"category": {"$regex": safe_orig, "$options": "i"}},
+            ])
+
+        matched = list(db.products.find(query).limit(10))
+    except Exception:
+        return None
+
+    if matched:
+        kw_display = kw_orig if kw_orig else kw_norm
+        lines = [f"Tìm thấy {len(matched)} sản phẩm phù hợp với '{kw_display}':"]
+        for p in matched:
+            name = p.get("name", "Sản phẩm")
+            price_str = money(p.get("price", 0))
+            stock = p.get("stock", 0)
+            stock_str = f"còn {stock} cái" if stock > 0 else "đã hết hàng"
+            lines.append(f"• {name} — Giá: {price_str} (Tồn kho: {stock_str})")
+        return "\n".join(lines)
+
+    if is_asking and len(search_term) >= 2:
+        kw_display = kw_orig if kw_orig else kw_norm
+        return f"Hiện không tìm thấy sản phẩm nào khớp với '{kw_display}' trong cửa hàng."
+
+    return None
+
+
 def _ask_rules(question: str) -> str:
     q = search_key(question)
 
@@ -263,6 +353,11 @@ def _ask_rules(question: str) -> str:
     for keywords, answer in USAGE.items():
         if any(k in q for k in keywords):
             return answer
+
+    # Tìm kiếm sản phẩm trong database MongoDB thay vì trả về HELP_TEXT
+    product_ans = _answer_product_search(question)
+    if product_ans:
+        return product_ans
 
     return HELP_TEXT
 
@@ -297,10 +392,15 @@ def _ask_gemini(question: str, history: list[dict]) -> str:
     # Kết hợp cẩm nang RAG, số liệu chung và số liệu cụ thể theo tháng nếu có
     relevant_knowledge = query_rag_context(question, n_results=2)
 
+    try:
+        data_summary = _data_snapshot()
+    except Exception:
+        data_summary = "Không thể lấy số liệu thực tế tại thời điểm này."
+
     system_instruction = (
         f"{APP_GUIDE}\n\n"
         f"--- TÀI LIỆU LIÊN QUAN (RAG) ---\n{relevant_knowledge}\n\n"
-        f"--- SỐ LIỆU THỰC TẾ HỆ THỐNG ---\n{_data_snapshot()}"
+        f"--- SỐ LIỆU THỰC TẾ HỆ THỐNG ---\n{data_summary}"
         f"{extra_context}"
     )
 
@@ -318,9 +418,13 @@ def _ask_gemini(question: str, history: list[dict]) -> str:
         })
 
     chat = model.start_chat(history=chat_history)
-    response = chat.send_message(question)
+    response = chat.send_message(
+        question,
+        request_options={"timeout": 15.0, "retry": None}
+    )
     
     return response.text
+
 
 def _extract_month_year(q: str):
     """Bóc tách tháng và năm từ câu hỏi nếu có (ví dụ: tháng 5/2026, tháng 5 năm 2026)."""
@@ -331,16 +435,57 @@ def _extract_month_year(q: str):
         return month, year
     return None, None
 
+
+QUICK_GREETING_ANSWER = (
+    "Chào bạn! Mình là trợ lý AI của TechStore. "
+    "Hỏi mình về doanh thu, tồn kho, sản phẩm bán chạy, khách hàng hoặc cách dùng phần mềm nhé!"
+)
+
+
+def _is_quick_greeting(question: str) -> bool:
+    """Kiểm tra nhanh các câu chào hỏi thông dụng để phản hồi tức thì."""
+    q = search_key(question).strip().rstrip("?!.,")
+    # Bỏ các từ đệm cuối câu (ạ, nha, nhé, ơi...)
+    q = re.sub(r"(?:\s+a|\s+nha|\s+nhe|\s+oi|\s+nhie)+$", "", q).strip()
+
+    quick_set = {
+        "alo", "alo shop", "alo ad", "alo bot", "alo ban",
+        "hi", "hi ban", "hi shop", "hi ad", "hi bot", "hi all", "hi cac ban",
+        "hello", "hello ban", "hello shop", "hello ad", "hello bot", "hello all",
+        "hey", "hey shop", "hey bot", "hey ad",
+        "chao", "chao ban", "chao shop", "chao ad", "chao bot", "chao em", "chao anh", "chao chi", "chao mn", "chao moi nguoi",
+        "xin chao", "xin chao ban", "xin chao shop", "xin chao ad", "xin chao bot", "xin chao moi nguoi"
+    }
+    return q in quick_set
+
+
+def _handle_quota_exceeded(question: str) -> str:
+    """Ghi log cảnh báo hết quota (429) và chuyển sang trả lời bằng dữ liệu nội bộ."""
+    print("\n>>> [CẢNH BÁO QUOTA - LỖI 429]: Gemini API đã hết lượt gọi miễn phí!\n")
+    return _ask_rules(question) + "\n\n(Thông báo: Gemini API hiện đã hết quota, hệ thống đang trả lời bằng dữ liệu nội bộ.)"
+
+
 def ask(question: str, history: list[dict] | None = None) -> str:
     question = (question or "").strip()
     if not question:
         return HELP_TEXT
 
+    # 1. Bắt nhanh các câu chào hỏi thông dụng, phản hồi tức thì không cần gọi RAG/API
+    if _is_quick_greeting(question):
+        return QUICK_GREETING_ANSWER
+
     if has_api():
         try:
-            return _ask_gemini(question, history or []) # Đổi từ _ask_claude thành _ask_gemini
-        except Exception as exc:
-            offline = _ask_rules(question)
-            return (f"{offline}\n\n(Không gọi được Gemini API — {exc}. "
-                    "Đã trả lời bằng chế độ offline.)")
+            return _ask_gemini(question, history or [])
+        except ResourceExhausted:
+            return _handle_quota_exceeded(question)
+        except (ServiceUnavailable, DeadlineExceeded):
+            print("\n>>> [CẢNH BÁO KẾT NỐI]: Máy chủ Google quá tải hoặc phản hồi chậm.\n")
+            return _ask_rules(question) + "\n\n(Thông báo: Kết nối tới Gemini AI đang gián đoạn, hệ thống tạm chuyển sang chế độ offline.)"
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "429" in err_msg or "quota" in err_msg:
+                return _handle_quota_exceeded(question)
+            print(f"\n>>> [LỖI GEMINI]: {e}\n")
+            return _ask_rules(question)
     return _ask_rules(question)

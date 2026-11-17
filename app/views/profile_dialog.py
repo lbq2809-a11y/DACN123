@@ -139,8 +139,8 @@ class ProfileDialog(tk.Toplevel):
         cv2.destroyAllWindows()
 
         if captured_frame is not None:
-            save_dir = Path("D:/Image")
-            save_dir.mkdir(parents=True, exist_ok=True)
+            save_dir = BASE_DIR / "data" / "face_images"
+            os.makedirs(save_dir, exist_ok=True)
             
             # Đặt tên file tự động dựa theo thời gian để tránh trùng lặp các góc chụp
             import time

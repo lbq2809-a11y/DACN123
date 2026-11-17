@@ -15,8 +15,12 @@ collection = client.get_or_create_collection(
     embedding_function=embedding_fn
 )
 
+_initialized = False
+
 def init_vector_db():
     """Nạp dữ liệu cẩm nang / tài liệu hướng dẫn vào Vector DB (chỉ cần chạy khi khởi động hoặc đồng bộ)."""
+    global _initialized
+    _initialized = True
     if collection.count() > 0:
         return  # Đã có dữ liệu thì bỏ qua
 
@@ -40,8 +44,10 @@ def init_vector_db():
 
 def query_rag_context(question: str, n_results: int = 2) -> str:
     """Tìm kiếm các đoạn văn bản có ý nghĩa tương đồng nhất với câu hỏi của người dùng."""
+    global _initialized
     try:
-        init_vector_db()
+        if not _initialized:
+            init_vector_db()
         results = collection.query(
             query_texts=[question],
             n_results=n_results
